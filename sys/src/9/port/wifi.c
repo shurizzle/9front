@@ -188,6 +188,18 @@ wifitx(Wifi *wifi, Wnode *wn, Block *b)
 		wn->actrate = a;
 	}
 
+	/* MCS rate up */
+	if(wn->mcsact >= 0 && (wn->mcstxcount++ & 255) == 255 && wn->mcsact < wn->mcsmax){
+		int m;
+
+		for(m = wn->mcsact + 1; m <= wn->mcsmax; m++){
+			if(wn->mcsvalid[m/8] & (1 << (m%8))){
+				wn->mcsact = m;
+				break;
+			}
+		}
+	}
+
 	(*wifi->transmit)(wifi, wn, b);
 }
 
@@ -217,6 +229,7 @@ nodelookup(Wifi *wifi, uchar *bssid, int new)
 		return nil;
 	freewifikeys(wifi, nn);
 	memset(nn, 0, sizeof(Wnode));
+	nn->mcsact = -1;	/* MCS disabled until negotiated */
 	memmove(nn->bssid, bssid, Eaddrlen);
 	return nn;
 }
@@ -242,6 +255,21 @@ wifitxfail(Wifi *wifi, Block *b)
 				a = p;
 		}
 		wn->actrate = a;
+	}
+
+	/* MCS rate down */
+	if(wn->mcsact >= 0){
+		wn->mcstxerror++;
+		if(wn->mcsact > wn->mcsmin){
+			int m;
+
+			for(m = wn->mcsact - 1; m >= wn->mcsmin; m--){
+				if(wn->mcsvalid[m/8] & (1 << (m%8))){
+					wn->mcsact = m;
+					break;
+				}
+			}
+		}
 	}
 }
 
@@ -339,6 +367,13 @@ wifiprobe(Wifi *wifi, Wnode *wn)
 	*p++ = 1;
 	*p++ = wn->channel;
 
+	if(wifi->htcapvalid){
+		*p++ = 45;	/* HT Capabilities IE */
+		*p++ = 26;
+		memmove(p, wifi->htcap, 26);
+		p += 26;
+	}
+
 	b->wp = p;
 	wifitx(wifi, wn, b);
 }
@@ -414,6 +449,13 @@ sendassoc(Wifi *wifi, Wnode *bss)
 	if(n > 0){
 		memmove(p, bss->rsne, n);
 		p += n;
+	}
+
+	if(wifi->htcapvalid && bss->htcapvalid){
+		*p++ = 45;	/* HT Capabilities IE */
+		*p++ = 26;
+		memmove(p, wifi->htcap, 26);
+		p += 26;
 	}
 
 	b->wp = p;
@@ -546,6 +588,21 @@ recvbeacon(Wifi *wifi, Wnode *wn, uchar *d, int len)
 			memmove(wn->brsne, &d[-2], len);
 			wn->brsnelen = len;
 			rsnset = 1;
+			break;
+		case 45:	/* HT Capabilities */
+			if(x - d < 26)
+				break;
+			memmove(wn->htcap, d, 26);
+			wn->htcapvalid = 1;
+			wn->htsgi = (d[0] >> 4) & 3;	/* bits 4-5: SGI 20/40MHz */
+			/* extract MCS supported set (bytes 3-18) */
+			memmove(wn->mcsvalid, d+3, 13);
+			break;
+		case 61:	/* HT Operation */
+			if(x - d < 22)
+				break;
+			wn->htchanwidth = (d[1] >> 2) & 1;	/* STA channel width */
+			wn->htextchan = d[1] & 3;		/* secondary channel offset */
 			break;
 		}
 	}
@@ -800,6 +857,7 @@ wifsproc(void *arg)
 
 	wn = &wnscan;
 	memset(wn, 0, sizeof(*wn));
+	wn->mcsact = -1;
 	memmove(wn->bssid, ether->bcast, Eaddrlen);
 
 	while(waserror())
@@ -820,7 +878,33 @@ Scan:
 	tmout = 0;
 	while((wn = wifi->bss) != nil){
 		if(wn->status == Sassoc || wn->status == Sblocked){
-			if((rate = wn->actrate) != nil)
+			if(wn->mcsact >= 0){
+				/* MCS rate: Mbps, per stream, GI and SGI */
+				static int mcs20_1[]  = { 7, 13, 20, 26, 39, 52, 59, 65};
+				static int mcs40_1[]  = {14, 27, 41, 54, 81,108,122,135};
+				static int mcs20_2[]  = {13, 26, 39, 52, 78,104,117,130};
+				static int mcs40_2[]  = {27, 54, 81,108,162,216,243,270};
+				static int mcs20_1s[] = { 8, 14, 22, 29, 43, 58, 65, 72};
+				static int mcs40_1s[] = {15, 30, 45, 60, 90,120,135,150};
+				static int mcs20_2s[] = {14, 29, 43, 58, 87,116,130,144};
+				static int mcs40_2s[] = {30, 60, 90,120,180,240,270,300};
+				int idx, nss;
+				int *table;
+
+				idx = wn->mcsact & 7;
+				nss = (wn->mcsact / 8) + 1;
+				if(wn->htchanwidth)
+					table = nss >= 2 ? mcs40_2 : mcs40_1;
+				else
+					table = nss >= 2 ? mcs20_2 : mcs20_1;
+				if(wn->htsgi){
+					if(wn->htchanwidth)
+						table = nss >= 2 ? mcs40_2s : mcs40_1s;
+					else
+						table = nss >= 2 ? mcs20_2s : mcs20_1s;
+				}
+				ethersetspeed(ether, table[idx]);
+			} else if((rate = wn->actrate) != nil)
 				ethersetspeed(ether, ((*rate & 0x7f)+3)/4);
 			ethersetlink(ether, 1);
 		}
@@ -1111,6 +1195,15 @@ wifistat(Wifi *wifi, char *p, char *e)
 		p = seprint(p, e, "bssid: %E\n", wn->bssid);
 		p = seprint(p, e, "status: %s\n", wn->status);
 		p = seprint(p, e, "channel: %.2d\n", wn->channel);
+
+		if(wn->htcapvalid){
+			if(wn->mcsact >= 0)
+				p = seprint(p, e, "ht: mcs%d %dMHz%s\n",
+					wn->mcsact, wn->htchanwidth ? 40 : 20,
+					wn->htsgi ? " sgi" : "");
+			else
+				p = seprint(p, e, "ht: supported\n");
+		}
 
 		/* only print key ciphers and key length */
 		rlock(&wifi->crypt);

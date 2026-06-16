@@ -57,6 +57,20 @@ struct Wnode
 	int	channel;
 	int	brsnelen;
 	uchar	brsne[258];
+
+	/* HT (802.11n) */
+	uchar	htcap[26];	/* HT Capabilities IE body */
+	int	htcapvalid;
+	uchar	mcsvalid[13];	/* bitmap MCS 0-76 */
+	uchar	mcsbasic[13];
+	int	mcsact;		/* current MCS index (-1 = legacy) */
+	int	mcsmin;
+	int	mcsmax;
+	int	htchanwidth;	/* 0=20MHz, 1=40MHz */
+	int	htextchan;	/* 0=none, 1=above, 3=below */
+	int	htsgi;		/* short guard interval supported */
+	ulong	mcstxcount;
+	ulong	mcstxerror;
 };
 
 struct Wifi
@@ -78,6 +92,10 @@ struct Wifi
 
 	/* supported data rates by hardware */
 	uchar	*rates;
+
+	/* HT (802.11n) driver capabilities */
+	uchar	htcap[26];	/* HT Capabilities IE to advertise */
+	int	htcapvalid;
 
 	/* effective base station */
 	Wnode	*bss;

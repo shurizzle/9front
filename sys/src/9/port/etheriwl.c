@@ -647,6 +647,13 @@ struct Ctlr {
 	FWImage *fw;
 
 	FWMem fwmem;
+
+	/* HT (802.11n) state */
+	int	htenabled;
+	int	htchanwidth;	/* 0=20MHz, 1=40MHz */
+	int	htextchan;	/* 0=none, 1=above, 3=below */
+	int	htsgi;		/* short guard interval */
+	int	nss;		/* number of spatial streams (1-2) */
 };
 
 /* controller types */
@@ -2407,10 +2414,17 @@ setstation(Ctlr *ctlr, int id, int type, uchar addr[6], Station *sta)
 	*p++ = id;			/* sta id */
 
 	if(ctlr->family >= 7000){
+		u32int htflags;
+
 		*p++ = 1 << 1;		/* modify mask */
 		p += 2;			/* reserved */
 
-		put32(p, 0<<26 | 0<<28);
+		htflags = 0;
+		if(ctlr->htenabled){
+			htflags |= (ctlr->htchanwidth ? 2 : 1) << 26;
+			htflags |= ctlr->htextchan << 28;
+		}
+		put32(p, htflags);
 		p += 4;			/* station_flags */
 
 		put32(p, 3<<26 | 3<<28);
@@ -2494,8 +2508,13 @@ setphycontext(Ctlr *ctlr, int amr)
 
 	*p++ = (ctlr->rxflags & RFlag24Ghz) != 0;
 	*p++ = ctlr->channel;	// channel number
-	*p++ = 0;		// channel width (20MHz<<val)
-	*p++ = 0;		// pos1 below 
+	if(ctlr->htenabled && ctlr->htchanwidth){
+		*p++ = 1;	// channel width 40MHz
+		*p++ = ctlr->htextchan;	// secondary channel offset
+	} else {
+		*p++ = 0;	// channel width 20MHz
+		*p++ = 0;	// no secondary channel
+	}
 
 	put32(p, ctlr->rfcfg.txantmask);
 	p += 4;
@@ -3794,6 +3813,39 @@ rxon(Ether *edev, Wnode *bss)
 			ctlr->rxflags |= RFlagShPreamble;
 		if(bss->cap & (1<<10))
 			ctlr->rxflags |= RFlagShSlot;
+
+		/* enable HT if both driver and BSS support it */
+		if(ctlr->wifi->htcapvalid && bss->htcapvalid){
+			int m, drivmax;
+
+			ctlr->htenabled = 1;
+			ctlr->htchanwidth = bss->htchanwidth;
+			ctlr->htextchan = bss->htextchan;
+			ctlr->htsgi = bss->htsgi;
+			bss->mcsmin = 0;
+
+			/* highest MCS the driver supports */
+			drivmax = ctlr->nss * 8 - 1;
+			if(drivmax > 76)
+				drivmax = 76;
+
+			/* highest MCS in intersection of driver and AP */
+			bss->mcsmax = 0;
+			for(m = drivmax; m >= 0; m--){
+				if(bss->mcsvalid[m/8] & (1 << (m%8))){
+					bss->mcsmax = m;
+					break;
+				}
+			}
+			bss->mcsact = 0;
+		} else {
+			ctlr->htenabled = 0;
+			ctlr->htchanwidth = 0;
+			ctlr->htextchan = 0;
+			ctlr->htsgi = 0;
+			bss->mcsact = -1;
+		}
+
 		if(ctlr->aid != 0){
 			ctlr->rxfilter |= FilterBSS;
 			ctlr->rxfilter &= ~FilterBeacon;
@@ -3938,8 +3990,21 @@ Broken:
 	put32(p, 0);
 	p += 4;		/* scratch */
 
-	*p++ = ratetab[rate].plcp;
-	*p++ = ratetab[rate].flags | (ant<<6);
+	/* select HT MCS rate or legacy rate */
+	if(wn->mcsact >= 0 && ctlr->htenabled){
+		uchar htflags;
+
+		htflags = 0;
+		if(ctlr->htchanwidth)
+			htflags |= 0x10;	/* HT 40MHz */
+		if(ctlr->htsgi)
+			htflags |= 0x08;	/* HT SGI */
+		*p++ = wn->mcsact;		/* MCS index */
+		*p++ = 0x20 | htflags | ((ctlr->rfcfg.txantmask & 3) << 6);
+	} else {
+		*p++ = ratetab[rate].plcp;
+		*p++ = ratetab[rate].flags | (ant<<6);
+	}
 
 	p += 2;		/* xflags */
 	*p++ = sta->id;	/* station id */
@@ -4129,6 +4194,54 @@ iwlattach(Ether *edev)
 			/* tested with 2230, it has transmit issues using higher bit rates */
 			if(ctlr->family >= 7000 || ctlr->type != Type2030)
 				ctlr->wifi->rates = iwlrates;
+
+			/* configure HT capabilities for family >= 7000 */
+			if(ctlr->family >= 7000){
+				uchar *h;
+				int nss, i;
+
+				/* determine spatial streams from antenna config */
+				nss = 0;
+				for(i = ctlr->rfcfg.rxantmask; i; i &= i-1)
+					nss++;
+				if(nss > 2)
+					nss = 2;
+				if(nss < 1)
+					nss = 1;
+				ctlr->nss = nss;
+
+				h = ctlr->wifi->htcap;
+				memset(h, 0, 26);
+
+				/* HT Capability Info (2 bytes) */
+				/* bit 0: LDPC, bit 1: 20/40MHz, bits 2-3: SM power save=disabled */
+				/* bit 4: SGI 20MHz, bit 5: SGI 40MHz, bits 7-8: Rx STBC 1 stream */
+				h[0] = (1<<0) | (1<<1) | (3<<2) | (1<<4) | (1<<5) | (1<<7);
+				h[1] = 0;
+
+				/* A-MPDU Parameters (1 byte) */
+				/* max A-MPDU length exponent = 0 (8191 bytes) */
+				/* min MPDU start spacing = 0 (no restriction) */
+				h[2] = 0;
+
+				/* Supported MCS Set (16 bytes) */
+				/* first 13 bytes: MCS bitmask for streams 1-nss */
+				memset(h+3, 0, 13);
+				for(i = 0; i < nss * 8; i++)
+					h[3 + i/8] |= 1 << (i%8);
+
+				/* HT Extended Capabilities (1 byte) */
+				h[19] = 0;
+
+				/* Transmit Beamforming Capabilities (4 bytes) */
+				/* ASEL Capabilities (2 bytes) */
+				/* all zeros */
+
+				ctlr->wifi->htcapvalid = 1;
+				ctlr->htenabled = 0;	/* enabled when BSS supports HT */
+			} else {
+				ctlr->nss = 1;	/* no HT, legacy only */
+			}
 		}
 
 		setoptions(edev);
